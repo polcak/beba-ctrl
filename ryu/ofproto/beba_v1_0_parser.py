@@ -87,6 +87,14 @@ def OFPExpMsgKeyExtract(datapath, command, fields, table_id,bit=0):
             data+=struct.pack(field_extract_format,fields[f])
     
     exp_type=bebaproto.OFPT_EXP_STATE_MOD
+
+    # store lookup-scopes
+    if command == bebaproto.OFPSC_EXP_SET_L_EXTRACTOR:
+        if hasattr(datapath, 'lookup_scope'):
+            datapath.lookup_scope[table_id] = fields
+        else:
+            datapath.lookup_scope = {table_id: fields}
+
     return ofproto_parser.OFPExperimenter(datapath=datapath, experimenter=0xBEBABEBA, exp_type=exp_type, data=data)
 
 def OFPExpMsgSetFlowState(datapath, state, keys, table_id, idle_timeout=0, idle_rollback=0, hard_timeout=0, hard_rollback=0, state_mask=0xffffffff):
@@ -306,28 +314,22 @@ class OFPStateEntry(object):
         self.state = state
     
     @classmethod
-    def parser(cls, buf, offset):
-        entry = OFPStateEntry()
+    def parser(cls, buf, offset, key_count, state):
+        entry = OFPStateEntry(key_count=key_count, state=state)
 
-        key_count = struct.unpack_from('!I', buf, offset)
-        entry.key_count = key_count[0]
-        offset += 4
-        entry.key=[]
+        entry.key = []
         if entry.key_count <= bebaproto.MAX_KEY_LEN:
             for f in range(entry.key_count):
                 key=struct.unpack_from('!B',buf,offset,)
                 entry.key.append(key[0])
                 offset +=1
-        offset += (bebaproto.MAX_KEY_LEN - entry.key_count)
 
-        state = struct.unpack_from('!I', buf, offset)
-        entry.state=state[0]
-        offset += 4
+        offset += (utils.round_up(entry.key_count, 8) - entry.key_count)
 
-        return entry
+        return entry, offset
 
 class OFPStateStats(StringifyMixin):
-    def __init__(self, table_id=None, dur_sec=None, dur_nsec=None, field_count=None, fields=None, 
+    def __init__(self, table_id=None, dur_sec=None, dur_nsec=None, field_count=None, fields=None,
         entry=None,length=None, hard_rb=None, idle_rb=None, hard_to=None, idle_to=None):
         super(OFPStateStats, self).__init__()
         self.length = 0
@@ -343,31 +345,27 @@ class OFPStateStats(StringifyMixin):
         self.hard_rb = hard_rb
         
     @classmethod
-    def parser(cls, buf, offset=0):
+    def parser(cls, msg, offset=0):
         state_stats_list = []
-        
-        for i in range(len(buf)/bebaproto.OFP_STATE_STATS_SIZE):
+
+        buf = msg.body.data
+
+        while len(buf)-offset > 0:
             state_stats = cls()
 
-            (state_stats.length, state_stats.table_id, state_stats.dur_sec,
-                state_stats.dur_nsec, state_stats.field_count) = struct.unpack_from(
-                bebaproto.OFP_STATE_STATS_0_PACK_STR, buf, offset)
-            offset += bebaproto.OFP_STATE_STATS_0_SIZE
+            (state_stats.length, state_stats.table_id, state_stats.key_len, state_stats.dur_sec,
+                state_stats.dur_nsec, state_stats.hard_rb, state_stats.idle_rb,state_stats.hard_to,
+                state_stats.idle_to, state_stats.state) = struct.unpack_from(
+                    bebaproto.OFP_STATE_STATS_PACK_STR, buf, offset)
+            offset += bebaproto.OFP_STATE_STATS_SIZE
 
-            state_stats.fields=[]
-            field_extract_format='!I'
-            if state_stats.field_count <= bebaproto.MAX_FIELD_COUNT:
-                for f in range(state_stats.field_count):
-                    field=struct.unpack_from(field_extract_format,buf,offset)
-                    state_stats.fields.append(field[0])
-                    offset +=4
-            offset += ((bebaproto.MAX_FIELD_COUNT-state_stats.field_count)*4)
-            state_stats.entry = OFPStateEntry.parser(buf, offset)
-            offset += bebaproto.OFP_STATE_STATS_ENTRY_SIZE
+            if state_stats.table_id not in msg.datapath.lookup_scope:
+                continue
+            state_stats.fields = msg.datapath.lookup_scope[state_stats.table_id]
+            state_stats.field_count = len(state_stats.fields)
 
-            (state_stats.hard_rb, state_stats.idle_rb,state_stats.hard_to, state_stats.idle_to) = struct.unpack_from(
-                bebaproto.OFP_STATE_STATS_1_PACK_STR, buf, offset)
-            offset += bebaproto.OFP_STATE_STATS_1_SIZE
+            state_stats.entry, offset = OFPStateEntry.parser(buf, offset, state_stats.key_len, state_stats.state)
+
             state_stats_list.append(state_stats)
 
         return state_stats_list
